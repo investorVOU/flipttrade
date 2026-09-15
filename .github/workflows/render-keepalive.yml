@@ -10,10 +10,10 @@ permissions:
 
 jobs:
   ping:
-    if: ${{ secrets.RENDER_HEALTH_URL != '' }}
     runs-on: ubuntu-latest
+    env:
+      RENDER_HEALTH_URL: ${{ secrets.RENDER_HEALTH_URL }}
     steps:
       - name: Ping bot health endpoint
+        if: ${{ env.RENDER_HEALTH_URL != '' }}
         run: curl --fail --silent --show-error --max-time 20 "$RENDER_HEALTH_URL/health"
-        env:
-          RENDER_HEALTH_URL: ${{ secrets.RENDER_HEALTH_URL }}
