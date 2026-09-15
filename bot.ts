@@ -40,6 +40,12 @@ const config = {
   closeLegacyPositions: process.env.CLOSE_LEGACY_POSITIONS === 'true',
   legacyClosePercent: numberSetting('LEGACY_CLOSE_PERCENT', 100, 1),
   maxLegacyClosesPerCycle: numberSetting('MAX_LEGACY_CLOSES_PER_CYCLE', 5, 1),
+  autoBond: process.env.AUTO_BOND === 'true',
+  autoUnbond: process.env.AUTO_UNBOND === 'true',
+  maxBondUsdc: numberSetting('MAX_BOND_USDC', 1, 1),
+  bondTokenPercent: numberSetting('BOND_TOKEN_PERCENT', 10, 1),
+  unbondPercent: numberSetting('UNBOND_PERCENT', 100, 1),
+  unbondAfterCycles: numberSetting('UNBOND_AFTER_CYCLES', 2, 0),
   discoveryBlocks: numberSetting('DISCOVERY_BLOCKS', 5_000, 100),
 }
 
@@ -47,6 +53,7 @@ if (config.maxBuy < 1.5) throw new Error('MAX_BUY_USDC must be at least 1.5.')
 
 if (config.sellPercent > 100) throw new Error('SELL_PERCENT must not exceed 100.')
 if (config.legacyClosePercent > 100) throw new Error('LEGACY_CLOSE_PERCENT must not exceed 100.')
+if (config.bondTokenPercent > 100 || config.unbondPercent > 100) throw new Error('Bond and unbond percentages must not exceed 100.')
 const account = privateKeyToAccount(required('PRIVATE_KEY') as `0x${string}`)
 const publicClient = createPublicClient({ chain: ARC, transport: http() })
 const walletClient = createWalletClient({ account, chain: ARC, transport: http() })
@@ -111,6 +118,21 @@ function encodeCollect(token: Address): Hex {
   return concatHex([FLIPT.collectSelector, encodeAbiParameters([{ type: 'address' }], [token])])
 }
 
+function encodeBond(token: Address, tokenAmount: bigint, usdcAmount: bigint): Hex {
+  const deadline = BigInt(Math.floor(Date.now() / 1_000) + 10 * 60)
+  return concatHex(['0x2aaeb990', encodeAbiParameters([
+    { type: 'address' }, { type: 'uint256' }, { type: 'uint256' },
+    { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' }, { type: 'uint256' },
+  ], [token, tokenAmount, usdcAmount, 0n, 0n, 0n, deadline])])
+}
+
+function encodeUnbond(token: Address, liquidity: bigint): Hex {
+  const deadline = BigInt(Math.floor(Date.now() / 1_000) + 10 * 60)
+  return concatHex(['0x13928082', encodeAbiParameters([
+    { type: 'address' }, { type: 'uint256' }, { type: 'uint256' },
+    { type: 'uint256' }, { type: 'uint256' },
+  ], [token, liquidity, 0n, 0n, deadline])])
+}
 async function ensureUsdcAllowance(requiredAmount: bigint) {
   const allowanceData = concatHex(['0xdd62ed3e', encodeAbiParameters([{ type: 'address' }, { type: 'address' }], [account.address, FLIPT.router])])
   const allowanceResult = await publicClient.call({ to: FLIPT.usdc, data: allowanceData })
@@ -124,6 +146,18 @@ async function ensureUsdcAllowance(requiredAmount: bigint) {
   console.log(`  -> USDC approval confirmed: ${hash}`)
 }
 
+async function ensureTokenAllowance(token: Address, requiredAmount: bigint) {
+  const allowanceData = concatHex(['0xdd62ed3e', encodeAbiParameters([{ type: 'address' }, { type: 'address' }], [account.address, FLIPT.router])])
+  const allowanceResult = await publicClient.call({ to: token, data: allowanceData })
+  const allowance = BigInt(allowanceResult.data || '0x0')
+  if (allowance >= requiredAmount) return
+
+  const approveData = concatHex(['0x095ea7b3', encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [FLIPT.router, requiredAmount])])
+  const hash = await walletClient.sendTransaction({ to: token, data: approveData })
+  const receipt = await publicClient.waitForTransactionReceipt({ hash })
+  if (receipt.status !== 'success') throw new Error(`Token approval failed: ${hash}`)
+  console.log(`  -> token approval confirmed: ${hash}`)
+}
 async function grindLaunchSalt(name: string, symbol: string): Promise<{ salt: Hex; address: Address }> {
   const [graduationFactory, totalSupply] = await Promise.all([
     publicClient.readContract({ address: FLIPT.router, abi: FLIPT_ABI, functionName: 'graduationFactory' }),
@@ -152,7 +186,7 @@ const dataDir = path.resolve('data')
 const eventsPath = path.join(dataDir, 'events.jsonl')
 const statsPath = path.join(dataDir, 'stats.json')
 
-type Action = 'create' | 'buy' | 'sell' | 'collect' | 'unbond' | 'hold'
+type Action = 'create' | 'buy' | 'sell' | 'bond' | 'collect' | 'unbond' | 'hold'
 type Stats = Record<Action, number> & { cycles: number; spentUsd: number; nativeGasUsdc: number; fliptUsdc: number; startedAt: string; updatedAt: string }
 
 let activeToken: Address | undefined
@@ -183,7 +217,7 @@ function randomSymbol(name: string) {
 }
 
 async function loadStats(): Promise<Stats> {
-  const blank: Stats = { cycles: 0, spentUsd: 0, nativeGasUsdc: 0, fliptUsdc: 0, create: 0, buy: 0, sell: 0, collect: 0, unbond: 0, hold: 0, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+  const blank: Stats = { cycles: 0, spentUsd: 0, nativeGasUsdc: 0, fliptUsdc: 0, create: 0, buy: 0, sell: 0, bond: 0, collect: 0, unbond: 0, hold: 0, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
   try {
     return { ...blank, ...(JSON.parse(await readFile(statsPath, 'utf8')) as Partial<Stats>) }
   } catch (error: unknown) {
@@ -446,6 +480,105 @@ async function closeLegacyPositions(stats: Stats) {
 
   return closed > 0
 }
+type BondPosition = { token: Address; lpToken: Address; cycle: number }
+
+async function loadBondPositions(): Promise<BondPosition[]> {
+  try {
+    const lines = (await readFile(eventsPath, 'utf8')).trim().split('\n').filter(Boolean)
+    const positions: BondPosition[] = []
+    for (const line of lines) {
+      const event = JSON.parse(line) as { action?: string; token?: unknown; lpToken?: unknown; cycle?: unknown }
+      if (event.action !== 'bond' || typeof event.token !== 'string' || typeof event.lpToken !== 'string') continue
+      if (!/^0x[0-9a-fA-F]{40}$/.test(event.token) || !/^0x[0-9a-fA-F]{40}$/.test(event.lpToken)) continue
+      positions.push({ token: getAddress(event.token), lpToken: getAddress(event.lpToken), cycle: typeof event.cycle === 'number' ? event.cycle : 0 })
+    }
+    return positions
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw error
+  }
+}
+
+function mintedLpToken(receipt: { logs: readonly { address: Address; data: Hex; topics: readonly Hex[] }[] }): Address | undefined {
+  const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+  const zeroAddressTopic = `0x${''.padStart(64, '0')}`
+  for (const log of receipt.logs) {
+    const from = log.topics[1]?.toLowerCase()
+    const to = log.topics[2]?.toLowerCase()
+    if (log.topics[0]?.toLowerCase() !== transferTopic || from !== zeroAddressTopic || !to) continue
+    if (`0x${to.slice(-40)}`.toLowerCase() !== account.address.toLowerCase()) continue
+    if (BigInt(log.data) > 0n) return getAddress(log.address)
+  }
+}
+
+async function bondTrackedPosition(stats: Stats) {
+  if (config.dryRun || !config.autoBond) return false
+  const positions = await loadBondPositions()
+  const candidates = [...trackedTokens].sort(() => Math.random() - 0.5)
+
+  for (const token of candidates.slice(0, 1)) {
+    try {
+      const priorPosition = positions.find((position) => position.token.toLowerCase() === token.toLowerCase())
+      if (priorPosition && (await tokenBalance(priorPosition.lpToken)) > 0n) continue
+
+      const balance = await tokenBalance(token)
+      const tokenAmount = balance * BigInt(config.bondTokenPercent) / 100n
+      if (tokenAmount === 0n) continue
+
+      const usdcAvailable = await getFliptUsdcBalance(account.address)
+      const usdcAmount = parseUnits(Math.min(config.maxBondUsdc, usdcAvailable).toFixed(6), FLIPT.usdcDecimals)
+      if (usdcAmount === 0n) return false
+
+      console.log(`[BOND]   testing ${token} with ${config.bondTokenPercent}% token balance and up to $${config.maxBondUsdc.toFixed(2)} USDC`)
+      await ensureTokenAllowance(token, tokenAmount)
+      await ensureUsdcAllowance(usdcAmount)
+      const data = encodeBond(token, tokenAmount, usdcAmount)
+      await publicClient.call({ account: account.address, to: FLIPT.router, data })
+      const hash = await walletClient.sendTransaction({ to: FLIPT.router, data })
+      const receipt = await publicClient.waitForTransactionReceipt({ hash })
+      if (receipt.status !== 'success') throw new Error(`Bond transaction failed: ${hash}`)
+
+      const lpToken = mintedLpToken(receipt)
+      if (!lpToken) throw new Error(`Bond succeeded but no LP mint was found in receipt: ${hash}`)
+      await record(stats, 'bond', { token, lpToken, tokenAmount: tokenAmount.toString(), usdcAmount: usdcAmount.toString(), cycle: stats.cycles, hash })
+      console.log(`[BOND]   bonded ${token}; LP position ${lpToken}: ${hash}`)
+      return true
+    } catch (error) {
+      console.log(`[BOND]   skipped ${token}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  return false
+}
+
+async function unbondMaturedPosition(stats: Stats) {
+  if (config.dryRun || !config.autoUnbond) return false
+  const positions = await loadBondPositions()
+  const seen = new Set<string>()
+
+  for (const position of positions) {
+    if (seen.has(position.lpToken.toLowerCase()) || stats.cycles - position.cycle < config.unbondAfterCycles) continue
+    seen.add(position.lpToken.toLowerCase())
+    try {
+      const lpBalance = await tokenBalance(position.lpToken)
+      const liquidity = lpBalance * BigInt(config.unbondPercent) / 100n
+      if (liquidity === 0n) continue
+
+      console.log(`[UNBOND] removing ${config.unbondPercent}% of LP position ${position.lpToken}`)
+      await ensureTokenAllowance(position.lpToken, liquidity)
+      const data = encodeUnbond(position.token, liquidity)
+      await publicClient.call({ account: account.address, to: FLIPT.router, data })
+      const hash = await walletClient.sendTransaction({ to: FLIPT.router, data })
+      const receipt = await publicClient.waitForTransactionReceipt({ hash })
+      if (receipt.status !== 'success') throw new Error(`Unbond transaction failed: ${hash}`)
+      await record(stats, 'unbond', { token: position.token, lpToken: position.lpToken, liquidity: liquidity.toString(), hash })
+      console.log(`[UNBOND] position closed: ${hash}`)
+      return true
+    } catch (error) {
+      console.log(`[UNBOND] skipped ${position.token}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  return false
+}
 async function createLaunch(stats: Stats) {
   const name = randomName()
   const symbol = randomSymbol(name)
@@ -529,7 +662,9 @@ async function managePosition(stats: Stats) {
     await collectCreatorRewards(stats)
     const closedLegacy = await closeLegacyPositions(stats)
     const soldForProfit = await sellTrackedPosition(stats)
-    if (!closedLegacy && !soldForProfit) await record(stats, 'hold')
+    const unbonded = await unbondMaturedPosition(stats)
+    const bonded = await bondTrackedPosition(stats)
+    if (!closedLegacy && !soldForProfit && !unbonded && !bonded) await record(stats, 'hold')
     return
   }
   if (Math.random() > 0.65) {
