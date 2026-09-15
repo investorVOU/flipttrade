@@ -1,0 +1,21 @@
+{
+  "name": "flipt-single-wallet-grinder",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx bot.ts",
+    "dev": "tsx watch bot.ts",
+    "typecheck": "tsc --noEmit",
+    "dashboard": "tsx dashboard.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "viem": "^2.38.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
