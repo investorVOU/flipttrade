@@ -220,6 +220,28 @@ async function telegramNotify(message: string) {
   }
 }
 
+async function registerTelegramCommands() {
+  if (!telegramToken) return
+  try {
+    await fetch(`https://api.telegram.org/bot${telegramToken}/setMyCommands`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        commands: [
+          { command: 'start', description: 'Resume trading cycles' },
+          { command: 'resume', description: 'Resume trading cycles' },
+          { command: 'pause', description: 'Pause after the current transaction' },
+          { command: 'stop', description: 'Pause after the current transaction' },
+          { command: 'status', description: 'Show balances and totals' },
+          { command: 'help', description: 'Show available commands' },
+        ],
+      }),
+    })
+  } catch (error) {
+    console.error('Telegram command registration failed:', error)
+  }
+}
+
 function telegramStatus() {
   const stats = activeStats
   return [
@@ -595,6 +617,7 @@ createServer((request, response) => {
   response.end('Flipt bot is running. Use Telegram /status for details.\n')
 }).listen(servicePort, () => console.log(`Health service: http://localhost:${servicePort}/health`))
 
+void registerTelegramCommands()
 void startTelegramPolling()
 main().catch((error: unknown) => {
   console.error(error)
