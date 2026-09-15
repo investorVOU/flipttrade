@@ -514,7 +514,8 @@ function mintedLpToken(receipt: { logs: readonly { address: Address; data: Hex; 
 async function bondTrackedPosition(stats: Stats) {
   if (config.dryRun || !config.autoBond) return false
   const positions = await loadBondPositions()
-  const candidates = [...trackedTokens].sort(() => Math.random() - 0.5)
+  const discovered = await discoverOtherLaunches().catch(() => [] as Address[])
+  const candidates = [...new Set([...trackedTokens, ...discovered])].sort(() => Math.random() - 0.5)
 
   for (const token of candidates.slice(0, 1)) {
     try {
