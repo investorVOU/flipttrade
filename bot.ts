@@ -235,37 +235,20 @@ const walletClient = createWalletClient({
 })
 
 const FLIPT = {
-  router:
-    '0x4b33146f2bcc75574534374c85662f9e51c38aca'
-      as Address,
+  router: '0x4b33146f2bcc75574534374c85662f9e51c38aca' as Address,
+  lens: '0x6ab2635fec3c426d825d005e24cfc05b82ea3994' as Address,
+  usdc: '0x4f3b8005d6b3f4994a791d971bcd153e114d20c2' as Address,
 
-  lens:
-    '0x6ab2635fec3c426d825d005e24cfc05b82ea3994'
-      as Address,
-
-  usdc:
-    '0x4f3b8005d6b3f4994a791d971bcd153e114d20c2'
-      as Address,
-
-  createSelector:
-    '0xe43d45f0' as Hex,
-
-  buySelector:
-    '0xc3b88b53' as Hex,
-
-  sellSelector:
-    '0x6a272462' as Hex,
-
-  collectSelector:
-    '0x06ec16f8' as Hex,
+  createSelector: '0xe43d45f0' as Hex,
+  buySelector: '0xc3b88b53' as Hex,
+  sellSelector: '0x6a272462' as Hex,
+  collectSelector: '0x06ec16f8' as Hex,
 
   launchEvent:
-    '0x4b0d70e7e0cdb8221fc029a6d8b8df90893d2756ded597aeea9118a06a7e0e95'
-      as Hex,
+    '0x4b0d70e7e0cdb8221fc029a6d8b8df90893d2756ded597aeea9118a06a7e0e95' as Hex,
 
   defaultTarget:
-    '0x05f2b07f2002f045a5eac3c067078bd6427b69d2'
-      as Address,
+    '0x05f2b07f2002f045a5eac3c067078bd6427b69d2' as Address,
 
   usdcDecimals: 6,
 } as const
