@@ -32,7 +32,8 @@ const config = {
   dryRun: process.env.DRY_RUN !== 'false',
   fastMode: process.env.FAST_MODE === 'true',
   minBalance: numberSetting('MIN_BALANCE_USDC', 3),
-  maxBuy: numberSetting('MAX_BUY_USDC', 10, 1),
+  maxBuy: numberSetting('MAX_BUY_USDC', 50, 1),
+  minBuy: numberSetting('MIN_BUY_USDC', 10, 1),
   maxCycles: numberSetting('MAX_CYCLES', 0),
   maxTotalSpend: numberSetting('MAX_TOTAL_SPEND_USDC', 50, 1),
   sellPercent: numberSetting('SELL_PERCENT', 25, 1),
@@ -49,7 +50,8 @@ const config = {
   discoveryBlocks: numberSetting('DISCOVERY_BLOCKS', 5_000, 100),
 }
 
-if (config.maxBuy < 1.5) throw new Error('MAX_BUY_USDC must be at least 1.5.')
+if (config.maxBuy < 1.5 || config.minBuy < 1.5) throw new Error('Buy amounts must be at least 1.5 USDC.')
+if (config.maxBuy < config.minBuy) throw new Error('MAX_BUY_USDC must be at least MIN_BUY_USDC.')
 
 if (config.sellPercent > 100) throw new Error('SELL_PERCENT must not exceed 100.')
 if (config.legacyClosePercent > 100) throw new Error('LEGACY_CLOSE_PERCENT must not exceed 100.')
@@ -187,7 +189,7 @@ const eventsPath = path.join(dataDir, 'events.jsonl')
 const statsPath = path.join(dataDir, 'stats.json')
 
 type Action = 'create' | 'buy' | 'sell' | 'bond' | 'collect' | 'unbond' | 'hold'
-type Stats = Record<Action, number> & { cycles: number; spentUsd: number; nativeGasUsdc: number; fliptUsdc: number; startedAt: string; updatedAt: string }
+type Stats = Record<Action, number> & { cycles: number; spentUsd: number; nativeGasUsdc: number; fliptUsdc: number; creatorFeesUsd: number; startedAt: string; updatedAt: string }
 
 let activeToken: Address | undefined
 let stopping = false
@@ -217,7 +219,7 @@ function randomSymbol(name: string) {
 }
 
 async function loadStats(): Promise<Stats> {
-  const blank: Stats = { cycles: 0, spentUsd: 0, nativeGasUsdc: 0, fliptUsdc: 0, create: 0, buy: 0, sell: 0, bond: 0, collect: 0, unbond: 0, hold: 0, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+  const blank: Stats = { cycles: 0, spentUsd: 0, nativeGasUsdc: 0, fliptUsdc: 0, creatorFeesUsd: 0, create: 0, buy: 0, sell: 0, bond: 0, collect: 0, unbond: 0, hold: 0, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
   try {
     return { ...blank, ...(JSON.parse(await readFile(statsPath, 'utf8')) as Partial<Stats>) }
   } catch (error: unknown) {
@@ -227,6 +229,7 @@ async function loadStats(): Promise<Stats> {
 }
 
 async function record(stats: Stats, action: Action, details: Record<string, unknown> = {}) {
+  if (action === 'collect' && typeof details.creatorFeesUsd === 'number') stats.creatorFeesUsd += details.creatorFeesUsd
   stats[action] += 1
   stats.updatedAt = new Date().toISOString()
   await Promise.all([
@@ -234,8 +237,15 @@ async function record(stats: Stats, action: Action, details: Record<string, unkn
     writeFile(statsPath, `${JSON.stringify(stats, null, 2)}\n`),
   ])
   const token = typeof details.token === 'string' ? ` ${details.token}` : ''
+  const amounts: string[] = []
+  if (typeof details.amountUsd === 'number') amounts.push(action === 'buy' ? `bought ${details.amountUsd.toFixed(2)} USDC` : `${details.amountUsd.toFixed(2)} USDC`)
+  if (typeof details.proceedsUsd === 'number') amounts.push(`sold ${details.proceedsUsd.toFixed(2)} USDC`)
+  if (typeof details.creatorFeesUsd === 'number') amounts.push(`creator fees ${details.creatorFeesUsd.toFixed(2)} USDC`)
+  if (typeof details.initialBuyUsd === 'number') amounts.push(`initial buy ${details.initialBuyUsd.toFixed(2)} USDC`)
+  if (typeof details.usdcAmount === 'string') amounts.push(`liquidity ${Number(formatUnits(BigInt(details.usdcAmount), FLIPT.usdcDecimals)).toFixed(2)} USDC`)
+  const amountText = amounts.length ? ` — ${amounts.join(', ')}` : ''
   const hash = typeof details.hash === 'string' ? `\n${details.hash}` : ''
-  void telegramNotify(`[${config.dryRun ? 'DRY' : 'LIVE'}] ${action}${token}${hash}`)
+  void telegramNotify(`[${config.dryRun ? 'DRY' : 'LIVE'}] ${action}${token}${amountText}${hash}`)
 }
 
 const telegramToken = process.env.TELEGRAM_BOT_TOKEN?.trim()
@@ -286,6 +296,7 @@ function telegramStatus() {
     `Cycles: ${stats?.cycles ?? 0}`,
     `Creates / buys / sells: ${stats?.create ?? 0} / ${stats?.buy ?? 0} / ${stats?.sell ?? 0}`,
     `Creator collections: ${stats?.collect ?? 0}`,
+    `Creator fees claimed: ${(stats?.creatorFeesUsd ?? 0).toFixed(2)} USDC`,
     `Tracked spend: $${(stats?.spentUsd ?? 0).toFixed(2)}`,
   ].join('\n')
 }
@@ -373,11 +384,14 @@ async function collectCreatorRewards(stats: Stats) {
     const data = encodeCollect(token)
     try {
       await publicClient.call({ account: account.address, to: FLIPT.router, data })
+      const before = await getFliptUsdcBalance(account.address)
       const hash = await walletClient.sendTransaction({ to: FLIPT.router, data })
       const receipt = await publicClient.waitForTransactionReceipt({ hash })
       if (receipt.status !== 'success') throw new Error(`Collect transaction failed: ${hash}`)
-      await record(stats, 'collect', { token, hash })
-      console.log(`[COLLECT] creator fees claimed for ${token}: ${hash}`)
+      const after = await getFliptUsdcBalance(account.address)
+      const creatorFeesUsd = Math.max(0, after - before)
+      await record(stats, 'collect', { token, creatorFeesUsd: Number(creatorFeesUsd.toFixed(6)), hash })
+      console.log(`[COLLECT] creator fees claimed for ${token}: ${creatorFeesUsd.toFixed(2)}: ${hash}`)
     } catch (error) {
       console.log(`[COLLECT] no claimable creator fees for ${token}`)
       console.debug(error)
@@ -627,6 +641,13 @@ async function buyOnCurve(stats: Stats, amountUsd: number) {
       console.log(`[BUY]    spend cap reached; skipping this buy.`)
       return false
     }
+    const availableUsd = await getFliptUsdcBalance(account.address)
+    const spendableUsd = Math.max(0, availableUsd - 0.1)
+    if (spendableUsd < 1.5) {
+      console.log(`[BUY]    only ${availableUsd.toFixed(2)} Flipt USDC available; skipping.`)
+      return false
+    }
+    amountUsd = Math.min(amountUsd, spendableUsd)
     const amount = parseUnits(amountUsd.toFixed(2), FLIPT.usdcDecimals)
     await ensureUsdcAllowance(amount)
     for (const token of await discoverOtherLaunches()) {
@@ -722,7 +743,7 @@ async function main() {
     await pause(20_000, 60_000)
 
     for (let index = 0; index < rand(1, 3) && !stopping; index += 1) {
-      await buyOnCurve(stats, randFloat(1.5, config.maxBuy))
+      await buyOnCurve(stats, randFloat(config.minBuy, config.maxBuy))
       await pause(15_000, 50_000)
     }
 

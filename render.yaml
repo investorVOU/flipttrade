@@ -34,3 +34,7 @@ services:
         value: "100"
       - key: UNBOND_AFTER_CYCLES
         value: "2"
+      - key: MAX_BUY_USDC
+        value: 50
+      - key: MIN_BUY_USDC
+        value: 10
