@@ -22,3 +22,15 @@ services:
         value: "500000"
       - key: MAX_CYCLES
         value: "0"
+      - key: AUTO_BOND
+        value: "true"
+      - key: AUTO_UNBOND
+        value: "true"
+      - key: MAX_BOND_USDC
+        value: "1"
+      - key: BOND_TOKEN_PERCENT
+        value: "10"
+      - key: UNBOND_PERCENT
+        value: "100"
+      - key: UNBOND_AFTER_CYCLES
+        value: "2"
