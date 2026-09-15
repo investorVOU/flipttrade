@@ -37,12 +37,16 @@ const config = {
   maxTotalSpend: numberSetting('MAX_TOTAL_SPEND_USDC', 50, 1),
   sellPercent: numberSetting('SELL_PERCENT', 25, 1),
   profitTargetPercent: numberSetting('PROFIT_TARGET_PERCENT', 20, 0),
+  closeLegacyPositions: process.env.CLOSE_LEGACY_POSITIONS === 'true',
+  legacyClosePercent: numberSetting('LEGACY_CLOSE_PERCENT', 100, 1),
+  maxLegacyClosesPerCycle: numberSetting('MAX_LEGACY_CLOSES_PER_CYCLE', 5, 1),
   discoveryBlocks: numberSetting('DISCOVERY_BLOCKS', 5_000, 100),
 }
 
 if (config.maxBuy < 1.5) throw new Error('MAX_BUY_USDC must be at least 1.5.')
 
 if (config.sellPercent > 100) throw new Error('SELL_PERCENT must not exceed 100.')
+if (config.legacyClosePercent > 100) throw new Error('LEGACY_CLOSE_PERCENT must not exceed 100.')
 const account = privateKeyToAccount(required('PRIVATE_KEY') as `0x${string}`)
 const publicClient = createPublicClient({ chain: ARC, transport: http() })
 const walletClient = createWalletClient({ account, chain: ARC, transport: http() })
@@ -387,6 +391,39 @@ async function sellTrackedPosition(stats: Stats) {
   return false
 }
 
+async function closeLegacyPositions(stats: Stats) {
+  if (config.dryRun || !config.closeLegacyPositions) return false
+
+  const costTracked = new Set((await loadCostPositions()).map((position) => position.token.toLowerCase()))
+  let closed = 0
+
+  for (const token of trackedTokens) {
+    if (closed >= config.maxLegacyClosesPerCycle) break
+    if (costTracked.has(token.toLowerCase())) continue
+
+    try {
+      const balance = await tokenBalance(token)
+      const amount = balance * BigInt(config.legacyClosePercent) / 100n
+      if (amount === 0n) continue
+
+      const quotedOut = await quoteSell(token, amount)
+      if (quotedOut === 0n) continue
+
+      const hash = await walletClient.sendTransaction({ to: FLIPT.router, data: encodeSell(token, amount) })
+      const receipt = await publicClient.waitForTransactionReceipt({ hash })
+      if (receipt.status !== 'success') throw new Error(`Legacy close transaction failed: ${hash}`)
+
+      const proceedsUsd = Number(formatUnits(quotedOut, FLIPT.usdcDecimals))
+      await record(stats, 'sell', { token, tokenAmount: amount.toString(), proceedsUsd, reason: 'legacy-close', hash })
+      console.log(`[SELL]   closed legacy position ${token}: ~$${proceedsUsd.toFixed(2)} quoted, ${hash}`)
+      closed++
+    } catch (error) {
+      console.log(`[SELL]   could not close legacy position ${token}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  return closed > 0
+}
 async function createLaunch(stats: Stats) {
   const name = randomName()
   const symbol = randomSymbol(name)
@@ -468,7 +505,9 @@ async function buyOnCurve(stats: Stats, amountUsd: number) {
 async function managePosition(stats: Stats) {
   if (!config.dryRun) {
     await collectCreatorRewards(stats)
-    if (!(await sellTrackedPosition(stats))) await record(stats, 'hold')
+    const closedLegacy = await closeLegacyPositions(stats)
+    const soldForProfit = await sellTrackedPosition(stats)
+    if (!closedLegacy && !soldForProfit) await record(stats, 'hold')
     return
   }
   if (Math.random() > 0.65) {
